@@ -45,6 +45,7 @@
 
 #include <Core/Settings.h>
 #include <Core/ServerSettings.h>
+#include <Interpreters/JoinInfo.h>
 
 namespace DB
 {
@@ -129,7 +130,7 @@ TableExpressionSet extractTableExpressionsSet(const QueryTreeNodePtr & node)
     return res;
 }
 
-std::set<JoinTableSide> extractJoinTableSidesFromExpression(//const ActionsDAG::Node * expression_root_node,
+std::set<JoinTableSide> extractJoinTableSidesFromExpression(
     const IQueryTreeNode * expression_root_node,
     const TableExpressionSet & left_table_expressions,
     const TableExpressionSet & right_table_expressions,
@@ -269,7 +270,6 @@ void buildJoinClause(
             auto & dag =  expression_side == JoinTableSide::Left ? left_dag : right_dag;
             const auto * node = appendExpression(dag, join_expression, planner_context, join_node);
             join_clause.addCondition(expression_side, node);
-
         }
         else if (left_expression_sides.size() == 1 && right_expression_sides.size() == 1)
         {
@@ -373,6 +373,119 @@ void buildJoinClause(
     }
 }
 
+static QueryTreeNodePtr getJoinExpressionFromNode(const JoinNode & join_node)
+{
+    /** It is possible to have constant value in JOIN ON section, that we need to ignore during DAG construction.
+      * If we do not ignore it, this function will be replaced by underlying constant.
+      * For example ASOF JOIN does not support JOIN with constants, and we should process it like ordinary JOIN.
+      *
+      * Example: SELECT * FROM (SELECT 1 AS id, 1 AS value) AS t1 ASOF LEFT JOIN (SELECT 1 AS id, 1 AS value) AS t2
+      * ON (t1.id = t2.id) AND 1 != 1 AND (t1.value >= t1.value);
+      */
+    const auto & join_expression = join_node.getJoinExpression();
+    const auto * constant_join_expression = join_expression->as<ConstantNode>();
+    if (constant_join_expression && constant_join_expression->hasSourceExpression())
+        return constant_join_expression->getSourceExpression();
+    return join_expression;
+}
+
+struct JoinInfoBuildContext
+{
+    explicit JoinInfoBuildContext(const JoinNode & join_node_)
+        : join_node(join_node_)
+        , left_table_expression_set(extractTableExpressionsSet(join_node.getLeftTableExpression()))
+        , right_table_expression_set(extractTableExpressionsSet(join_node.getRightTableExpression()))
+    {
+    }
+
+    std::set<JoinTableSide> getTableSides(const QueryTreeNodePtr & node)
+    {
+        return extractJoinTableSidesFromExpression(node.get(), left_table_expression_set, right_table_expression_set, join_node);
+    }
+
+    const JoinNode & join_node;
+    TableExpressionSet left_table_expression_set;
+    TableExpressionSet right_table_expression_set;
+};
+
+
+bool tryGetJoinPredicate(const FunctionNode * function_node, const QueryTreeNodePtr & node, JoinInfoBuildContext & builder_context, JoinCondition & join_condition)
+{
+    if (!function_node || function_node->getArguments().getNodes().size() != 2)
+        return false;
+
+    auto predicate_operator_opt = getJoinPredicateOperator(function_node->getFunctionName());
+    if (!predicate_operator_opt.has_value())
+        return false;
+    auto predicate_operator = *predicate_operator_opt;
+
+    auto left_node = function_node->getArguments().getNodes().at(0);
+    auto left_expression_side = builder_context.getTableSides(left_node);
+    if (left_expression_side.size() != 1)
+        return false;
+
+    auto right_node = function_node->getArguments().getNodes().at(1);
+    auto right_expression_side = builder_context.getTableSides(right_node);
+    if (right_expression_side.size() != 1)
+        return false;
+
+    if (left_expression_side == right_expression_side)
+        return false;
+
+    if (*left_expression_side.cbegin() == JoinTableSide::Right)
+        predicate_operator = reversePredicateOperator(predicate_operator);
+    join_condition.predicates.emplace_back(JoinPredicate{left_node, right_node, predicate_operator, node});
+    return true;
+}
+
+void buildJoinCondition(const QueryTreeNodePtr & node, JoinInfoBuildContext & builder_context, JoinCondition & join_condition)
+{
+    std::string function_name;
+    const auto * function_node = node->as<FunctionNode>();
+    if (function_node)
+        function_name = function_node->getFunction()->getName();
+
+    if (function_name == "and")
+    {
+        for (const auto & child : function_node->getArguments())
+            buildJoinCondition(child, builder_context, join_condition);
+        return;
+    }
+
+    bool is_predicate = tryGetJoinPredicate(function_node, node, builder_context, join_condition);
+    if (is_predicate)
+        return;
+    auto expression_sides = builder_context.getTableSides(node);
+    if (expression_sides == std::set{JoinTableSide::Left})
+        join_condition.left_filter_conditions.push_back(node);
+    else if (expression_sides == std::set{JoinTableSide::Right})
+        join_condition.right_filter_conditions.push_back(node);
+    else if (expression_sides.empty())
+        join_condition.right_filter_conditions.push_back(node);
+    else
+        join_condition.residual_conditions.push_back(node);
+}
+
+void buildDisjunctiveJoinConditions(const QueryTreeNodePtr & node, JoinInfoBuildContext & builder_context, std::vector<JoinCondition> & join_conditions)
+{
+    auto * function_node = node->as<FunctionNode>();
+    if (!function_node)
+        throw Exception(ErrorCodes::INVALID_JOIN_ON_EXPRESSION,
+            "JOIN {} join expression expected function",
+            node->formatASTForErrorMessage());
+
+    const auto & function_name = function_node->getFunction()->getName();
+
+    if (function_name == "or")
+    {
+        for (const auto & child : function_node->getArguments())
+            buildDisjunctiveJoinConditions(child, builder_context, join_conditions);
+        return;
+    }
+    buildJoinCondition(node, builder_context, join_conditions.emplace_back());
+}
+
+
 JoinClausesAndActions buildJoinClausesAndActions(
     const ColumnsWithTypeAndName & left_table_expression_columns,
     const ColumnsWithTypeAndName & right_table_expression_columns,
@@ -381,29 +494,15 @@ JoinClausesAndActions buildJoinClausesAndActions(
 {
     ActionsDAG left_join_actions(left_table_expression_columns);
     ActionsDAG right_join_actions(right_table_expression_columns);
+
     ColumnsWithTypeAndName mixed_table_expression_columns;
     for (const auto & left_column : left_table_expression_columns)
-    {
         mixed_table_expression_columns.push_back(left_column);
-    }
     for (const auto & right_column : right_table_expression_columns)
-    {
         mixed_table_expression_columns.push_back(right_column);
-    }
     ActionsDAG mixed_join_actions(mixed_table_expression_columns);
 
-    /** It is possible to have constant value in JOIN ON section, that we need to ignore during DAG construction.
-      * If we do not ignore it, this function will be replaced by underlying constant.
-      * For example ASOF JOIN does not support JOIN with constants, and we should process it like ordinary JOIN.
-      *
-      * Example: SELECT * FROM (SELECT 1 AS id, 1 AS value) AS t1 ASOF LEFT JOIN (SELECT 1 AS id, 1 AS value) AS t2
-      * ON (t1.id = t2.id) AND 1 != 1 AND (t1.value >= t1.value);
-      */
-    auto join_expression = join_node.getJoinExpression();
-    auto * constant_join_expression = join_expression->as<ConstantNode>();
-
-    if (constant_join_expression && constant_join_expression->hasSourceExpression())
-        join_expression = constant_join_expression->getSourceExpression();
+    auto join_expression = getJoinExpressionFromNode(join_node);
 
     auto * function_node = join_expression->as<FunctionNode>();
     if (!function_node)
@@ -647,6 +746,54 @@ JoinClausesAndActions buildJoinClausesAndActions(
 
     return result;
 }
+
+}
+
+
+JoinInfo buildJoinInfo(const JoinNode & join_node)
+{
+    JoinInfoBuildContext build_context(join_node);
+
+    JoinInfo join_info;
+    join_info.kind = join_node.getKind();
+    join_info.strictness = join_node.getStrictness();
+    join_info.locality = join_node.getLocality();
+
+    if (join_node.isUsingJoinExpression())
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "TODO");
+    }
+
+    auto join_expression_node = getJoinExpressionFromNode(join_node);
+
+    const auto * function_node = join_expression_node->as<FunctionNode>();
+    if (!function_node)
+        throw Exception(ErrorCodes::INVALID_JOIN_ON_EXPRESSION,
+            "JOIN {} join expression expected function",
+            join_node.formatASTForErrorMessage());
+    buildDisjunctiveJoinConditions(join_expression_node, build_context, join_info.expression.disjunctive_conditions);
+
+    return join_info;
+}
+
+ActionsDAG getJoinActionDags(
+    const JoinInfo & join_info,
+    const ColumnsWithTypeAndName & table_expression_columns,
+    const PlannerContextPtr & planner_context,
+    const JoinNode & join_node)
+{
+    ActionsDAG join_actions(table_expression_columns);
+
+    for (const auto & conditions : join_info.expression.disjunctive_conditions)
+    {
+        for (const auto & condition : conditions.left_filter_conditions)
+        {
+            const auto * node = appendExpression(join_actions, condition, planner_context, join_node);
+            UNUSED(node);
+            // join_clause.addCondition(expression_side, node);
+        }
+    }
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "TODO");
 
 }
 
