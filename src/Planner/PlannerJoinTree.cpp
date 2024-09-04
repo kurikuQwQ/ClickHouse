@@ -46,7 +46,6 @@
 #include <Processors/QueryPlan/ExpressionStep.h>
 #include <Processors/QueryPlan/FilterStep.h>
 #include <Processors/QueryPlan/JoinStep.h>
-#include <Processors/QueryPlan/JoinStep2.h>
 #include <Processors/QueryPlan/ArrayJoinStep.h>
 #include <Processors/QueryPlan/ReadFromMergeTree.h>
 #include <Processors/Sources/SourceFromSingleChunk.h>
@@ -1208,13 +1207,6 @@ JoinTreeQueryPlan buildQueryPlanForJoinNode(const QueryTreeNodePtr & join_table_
 
     if (!join_constant && join_node.isOnJoinExpression())
     {
-        auto join_info = buildJoinInfo(join_node);
-        {
-            auto desc = describeJoinActions(join_info);
-            for (const auto & d : desc)
-                LOG_DEBUG(&Poco::Logger::get("XXXX"), "{}:{}: {}: {}", __FILE__, __LINE__, d.first, d.second);
-        }
-
         join_clauses_and_actions = buildJoinClausesAndActions(left_plan_output_columns,
             right_plan_output_columns,
             join_table_expression,

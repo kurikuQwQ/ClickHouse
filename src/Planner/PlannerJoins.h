@@ -6,10 +6,8 @@
 #include <Interpreters/ActionsDAG.h>
 #include <Interpreters/TableJoin.h>
 #include <Interpreters/IJoin.h>
-#include <Interpreters/JoinInfo.h>
 
 #include <Analyzer/IQueryTreeNode.h>
-#include <Analyzer/JoinNode.h>
 
 namespace DB
 {
@@ -225,7 +223,5 @@ std::shared_ptr<IJoin> chooseJoinAlgorithm(std::shared_ptr<TableJoin> & table_jo
     const Block & left_table_expression_header,
     const Block & right_table_expression_header,
     const PlannerContextPtr & planner_context);
-
-JoinInfo buildJoinInfo(const JoinNode & join_node);
 
 }
